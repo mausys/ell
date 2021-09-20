@@ -173,14 +173,11 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long lo
                void *buffer, size_t count, void *user_data)
 {
 	struct l_aio_request *req = l_new(struct l_aio_request, 1);
+
 	req->cb = read_cb;
 	req->user_data = user_data;
 
-	struct iocb *iocb = &req->iocb;
-
-	struct iocb *iocbv[] = { iocb };
-
-	*iocb = (struct iocb) {
+	req->iocb = (struct iocb) {
 		.aio_fildes = fd,
 		.aio_lio_opcode = IOCB_CMD_PREAD,
 		.aio_reqprio = 0,
@@ -192,6 +189,8 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long lo
 		.aio_data = (intptr_t)req
 	};
 
+	struct iocb *iocbv[] = { &req->iocb };
+
 	return io_submit(aio->ctx, 1, iocbv);
 }
 
@@ -199,15 +198,11 @@ LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long l
                const void *buffer, size_t count, void *user_data)
 {
 	struct l_aio_request *req = l_new(struct l_aio_request, 1);
-	
+
 	req->cb = read_cb;
 	req->user_data = user_data;
 
-	struct iocb *iocb = &req->iocb;
-
-	struct iocb *iocbv[] = { iocb };
-  
-	*iocb = (struct iocb) {
+	req->iocb = (struct iocb) {
 		.aio_fildes = fd,
 		.aio_lio_opcode = IOCB_CMD_PWRITE,
 		.aio_reqprio = 0,
@@ -218,6 +213,8 @@ LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long l
 		.aio_resfd = l_io_get_fd(aio->evfd),
 		.aio_data = (intptr_t)req
 	};
+
+	struct iocb *iocbv[] = { &req->iocb };
 
 	return io_submit(aio->ctx, 1, iocbv);
 }
