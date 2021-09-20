@@ -139,7 +139,7 @@ static bool event_callback(struct l_io *io, void *user_data)
 	return true;
 }
 
-struct l_aio * l_aio_create(int maxevents)
+LIB_EXPORT struct l_aio * l_aio_create(int maxevents)
 {
 	struct l_aio *aio = l_new(struct l_aio, 1);
 	long r = io_setup(maxevents, &aio->ctx);
@@ -180,7 +180,6 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long lo
 
 	struct iocb *iocbv[] = { iocb };
 
-  
 	*iocb = (struct iocb) {
 		.aio_fildes = fd,
 		.aio_lio_opcode = IOCB_CMD_PREAD,
@@ -207,7 +206,6 @@ LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long l
 	struct iocb *iocb = &req->iocb;
 
 	struct iocb *iocbv[] = { iocb };
-
   
 	*iocb = (struct iocb) {
 		.aio_fildes = fd,
