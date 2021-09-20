@@ -38,7 +38,7 @@
 #include "aio.h"
 
 
-#define AIO_RING_MAGIC                  0xa10a10a1
+#define AIO_RING_MAGIC 0xa10a10a1
 
 struct aio_ring {
 	unsigned id;     /* kernel internal index number */
@@ -119,7 +119,7 @@ static bool event_callback(struct l_io *io, void *user_data)
 	for (;;) {
 		static struct timespec timeout = { 0, 0 };
 		struct io_event event;
-	
+
 		r = io_getevents(aio->ctx, 0, 1, &event, &timeout);
 
 		if (r != 1)
@@ -128,14 +128,14 @@ static bool event_callback(struct l_io *io, void *user_data)
 		struct l_aio_request* req = (struct l_aio_request*)event.data;
 
 		ssize_t result = event.res2;
-		
+
 		if (result >= 0)
 			result = event.res;
-			
+
 		req->cb(result, req->user_data);
 		l_free(req);
 	}
-	
+
 	return true;
 }
 
@@ -194,12 +194,12 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long lo
 	return io_submit(aio->ctx, 1, iocbv);
 }
 
-LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long long offset,
+LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, long long offset,
                const void *buffer, size_t count, void *user_data)
 {
 	struct l_aio_request *req = l_new(struct l_aio_request, 1);
 
-	req->cb = read_cb;
+	req->cb = write_cb;
 	req->user_data = user_data;
 
 	req->iocb = (struct iocb) {
