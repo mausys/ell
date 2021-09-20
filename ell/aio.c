@@ -116,10 +116,10 @@ static bool event_callback(struct l_io *io, void *user_data)
 	uint64_t c;
 	int r = read(l_io_get_fd(aio->evfd), &c, sizeof(c));
 
-	static struct timespec timeout = { 0, 0 };
-	struct io_event event;
-
 	for (;;) {
+		static struct timespec timeout = { 0, 0 };
+		struct io_event event;
+	
 		r = io_getevents(aio->ctx, 0, 1, &event, &timeout);
 
 		if (r != 1)
