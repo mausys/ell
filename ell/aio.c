@@ -37,6 +37,21 @@
 #include "io.h"
 #include "aio.h"
 
+
+#define AIO_RING_MAGIC                  0xa10a10a1
+
+struct aio_ring {
+	unsigned id;     /* kernel internal index number */
+	unsigned nr;     /* number of io_events */
+	unsigned head;
+	unsigned tail;
+
+	unsigned magic;
+	unsigned compat_features;
+	unsigned incompat_features;
+	unsigned header_length;  /* size of aio_ring */
+};
+
 struct l_aio_request {
 	struct iocb iocb;
 	l_aio_cb_t cb;
@@ -47,6 +62,24 @@ struct l_aio {
 	aio_context_t ctx;
 	struct l_io *evfd;
 };
+
+
+
+static bool io_ring_is_empty(aio_context_t ctx, struct timespec *timeout)
+{
+	struct aio_ring *ring = (struct aio_ring *)ctx;
+
+	if (!ring || ring->magic != AIO_RING_MAGIC)
+		return false;
+
+	if (!timeout || timeout->tv_sec || timeout->tv_nsec)
+		return false;
+
+	if (ring->head != ring->tail)
+		return false;
+
+	return true;
+}
 
 static int io_setup(int maxevents, aio_context_t *ctx)
 {
@@ -70,7 +103,10 @@ static int io_cancel(aio_context_t ctx, struct iocb *iocb, struct io_event *even
 
 static int io_getevents(aio_context_t ctx, long min_nr, long nr, struct io_event *events, struct timespec *timeout)
 {
-	return syscall(__NR_io_destroy, ctx, min_nr, nr, events, timeout);
+	if (io_ring_is_empty(ctx, timeout))
+		return 0;
+
+	return syscall(__NR_io_getevents, ctx, min_nr, nr, events, timeout);
 }
 
 static bool event_callback(struct l_io *io, void *user_data)
