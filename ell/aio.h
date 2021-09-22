@@ -39,11 +39,11 @@ struct l_aio *l_aio_create(unsigned maxevents);
 
 int l_aio_get_fd(struct l_aio *aio, unsigned reqid);
 
-int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long long offset,
+int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t offset,
                void *buffer, size_t count, void *user_data);
 
 
-int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, long long offset,
+int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t offset,
                const void *buffer, size_t count, void *user_data);
 
 bool l_aio_cancel(struct l_aio *aio, unsigned reqid, ssize_t *result);

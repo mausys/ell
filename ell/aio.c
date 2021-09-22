@@ -249,7 +249,7 @@ LIB_EXPORT int l_aio_get_fd(struct l_aio *aio, unsigned reqid)
 	return aio->list[reqid].iocb.aio_fildes;
 }
 
-LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long long offset,
+LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t offset,
 						  void *buffer, size_t count, void *user_data)
 {
 	if (unlikely(!aio))
@@ -289,7 +289,7 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long lo
 	return index;
 }
 
-LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, long long offset,
+LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t offset,
 						   const void *buffer, size_t count, void *user_data)
 {
 	if (unlikely(!aio))
