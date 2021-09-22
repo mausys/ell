@@ -164,7 +164,9 @@ static bool event_callback(struct l_io *io, void *user_data)
 	struct l_aio * aio = user_data;
 
 	uint64_t c;
-	read(l_io_get_fd(aio->eventfd), &c, sizeof(c));
+	int r = read(l_io_get_fd(aio->eventfd), &c, sizeof(c));
+
+	if (r < 0) {} //ignore error, we are polling anyway
 
 	for (;;) {
 		ssize_t result;
