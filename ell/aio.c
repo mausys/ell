@@ -29,11 +29,13 @@
 
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <linux/aio_abi.h>
 
 #include "private.h"
+#include "useful.h"
 #include "io.h"
 #include "aio.h"
 
@@ -52,22 +54,24 @@ struct aio_ring {
 	unsigned header_length;  /* size of aio_ring */
 };
 
-struct l_aio_request {
+struct entry {
 	struct iocb iocb;
-	l_aio_cb_t cb;
+	l_aio_cb_t callback;
 	void *user_data;
+	bool pending;
 };
 
 struct l_aio {
-	aio_context_t ctx;
-	struct l_io *evfd;
+	aio_context_t context;
+	struct entry *list;
+	unsigned entries;
+	unsigned index;
+	struct l_io *eventfd;
 };
 
-
-
-static bool io_ring_is_empty(aio_context_t ctx, struct timespec *timeout)
+static bool io_ring_is_empty(aio_context_t context, struct timespec *timeout)
 {
-	struct aio_ring *ring = (struct aio_ring *)ctx;
+	struct aio_ring *ring = (struct aio_ring *)context;
 
 	if (!ring || ring->magic != AIO_RING_MAGIC)
 		return false;
@@ -81,32 +85,78 @@ static bool io_ring_is_empty(aio_context_t ctx, struct timespec *timeout)
 	return true;
 }
 
-static int io_setup(int maxevents, aio_context_t *ctx)
+static int io_setup(unsigned maxevents, aio_context_t *context)
 {
-	return syscall(__NR_io_setup, maxevents, ctx);
+	return syscall(__NR_io_setup, maxevents, context);
 }
 
-static int io_destroy(aio_context_t ctx)
+static int io_destroy(aio_context_t context)
 {
-	return syscall(__NR_io_destroy, ctx);
+	return syscall(__NR_io_destroy, context);
 }
 
-static int io_submit(aio_context_t ctx, long nr, struct iocb *ios[])
+static int io_submit(aio_context_t context, long nr, struct iocb *ios[])
 {
-	return syscall(__NR_io_submit, ctx, nr, ios);
+	return syscall(__NR_io_submit, context, nr, ios);
 }
 
-static int io_cancel(aio_context_t ctx, struct iocb *iocb, struct io_event *event)
+static int io_cancel(aio_context_t context, struct iocb *iocb, struct io_event *event)
 {
-	return syscall(__NR_io_cancel, ctx, iocb, event);
+	return syscall(__NR_io_cancel, context, iocb, event);
 }
 
-static int io_getevents(aio_context_t ctx, long min_nr, long nr, struct io_event *events, struct timespec *timeout)
+static int io_getevents(aio_context_t context, long min_nr, long nr, struct io_event *events, struct timespec *timeout)
 {
-	if (io_ring_is_empty(ctx, timeout))
+	if (io_ring_is_empty(context, timeout))
 		return 0;
 
-	return syscall(__NR_io_getevents, ctx, min_nr, nr, events, timeout);
+	return syscall(__NR_io_getevents, context, min_nr, nr, events, timeout);
+}
+
+static ssize_t get_result(const struct io_event *event)
+{
+	ssize_t result = event->res2;
+
+	if (result >= 0)
+		result = event->res;
+
+	return result;
+}
+
+static void handle_request(struct entry *entry, ssize_t result)
+{
+	if (!entry)
+		return;
+
+	if (entry->callback)
+		entry->callback(result, entry->user_data);
+
+	entry->pending = false;
+}
+
+struct entry* await_next_block(struct l_aio *aio, struct timespec *timeout, ssize_t *result)
+{
+
+	for (;;) {
+		struct io_event event;
+
+		int r = io_getevents(aio->context, 0, 1, &event, timeout);
+
+		if (r == 1) {
+			struct entry *entry = (struct entry*)event.data;
+
+			if (result)
+				*result = get_result(&event);
+
+			return entry;
+		} else if ((r < 0) && (errno == EINTR)) {
+			continue;
+		} else {
+			break;
+		}
+	}
+
+	return NULL;
 }
 
 static bool event_callback(struct l_io *io, void *user_data)
@@ -114,70 +164,92 @@ static bool event_callback(struct l_io *io, void *user_data)
 	struct l_aio * aio = user_data;
 
 	uint64_t c;
-	int r = read(l_io_get_fd(aio->evfd), &c, sizeof(c));
+	read(l_io_get_fd(aio->eventfd), &c, sizeof(c));
 
 	for (;;) {
-		static struct timespec timeout = { 0, 0 };
-		struct io_event event;
+		ssize_t result;
+		static struct timespec timeout = { 0 };
 
-		r = io_getevents(aio->ctx, 0, 1, &event, &timeout);
+		struct entry* entry = await_next_block(aio, &timeout, &result);
 
-		if (r != 1)
+		if (!entry)
 			break;
 
-		struct l_aio_request* req = (struct l_aio_request*)event.data;
-
-		ssize_t result = event.res2;
-
-		if (result >= 0)
-			result = event.res;
-
-		req->cb(result, req->user_data);
-		l_free(req);
+		handle_request(entry, result);
 	}
-
 	return true;
 }
 
-LIB_EXPORT struct l_aio * l_aio_create(int maxevents)
+static int get_index(struct l_aio *aio)
 {
+	unsigned index = aio->index;
+
+	do {
+		if (!aio->list[index].pending)
+			return index;
+
+		index = (index + 1) % aio->entries;
+	} while (index != aio->index);
+
+	return -1;
+}
+
+LIB_EXPORT struct l_aio * l_aio_create(unsigned maxevents)
+{
+	if (unlikely(maxevents == 0))
+		return NULL;
+
 	struct l_aio *aio = l_new(struct l_aio, 1);
-	long r = io_setup(maxevents, &aio->ctx);
+
+	aio->entries = maxevents;
+
+	aio->list = l_new(struct entry, aio->entries);
+
+	int r = io_setup(maxevents, &aio->context);
 
 	if (r < 0)
 		goto error_init;
 
-	int evfd = eventfd(0, O_NONBLOCK | O_CLOEXEC);
+	int efd = eventfd(0, O_NONBLOCK | O_CLOEXEC);
 
-	if (evfd < 0)
+	if (efd < 0)
 		goto error_event;
 
-	aio->evfd = l_io_new(evfd);
+	aio->eventfd = l_io_new(efd);
 
-	if (!l_io_set_read_handler(aio->evfd, event_callback, aio, NULL))
+	if (!l_io_set_read_handler(aio->eventfd, event_callback, aio, NULL))
 		goto error_handler;
 
 	return aio;
 
 error_handler:
-	close(evfd);
-	l_io_destroy(aio->evfd);
+	close(efd);
+	l_io_destroy(aio->eventfd);
 error_event:
-	io_destroy(aio->ctx);
+	io_destroy(aio->context);
 error_init:
+	l_free(aio->list);
 	l_free(aio);
 	return NULL;
 }
 
 LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long long offset,
-               void *buffer, size_t count, void *user_data)
+						  void *buffer, size_t count, void *user_data)
 {
-	struct l_aio_request *req = l_new(struct l_aio_request, 1);
+	if (unlikely(!aio))
+		return -1;
 
-	req->cb = read_cb;
-	req->user_data = user_data;
+	int index = get_index(aio);
 
-	req->iocb = (struct iocb) {
+	if (index < 0)
+		return -1;
+
+	struct entry *entry = &aio->list[index];
+
+	entry->callback = read_cb;
+	entry->user_data = user_data;
+
+	entry->iocb = (struct iocb) {
 		.aio_fildes = fd,
 		.aio_lio_opcode = IOCB_CMD_PREAD,
 		.aio_reqprio = 0,
@@ -185,24 +257,39 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long lo
 		.aio_nbytes = count,
 		.aio_offset = offset,
 		.aio_flags = IOCB_FLAG_RESFD,
-		.aio_resfd = l_io_get_fd(aio->evfd),
-		.aio_data = (intptr_t)req
+		.aio_resfd = l_io_get_fd(aio->eventfd),
+		.aio_data = (intptr_t)entry
 	};
 
-	struct iocb *iocbv[] = { &req->iocb };
+	struct iocb *iocbv[] = { &entry->iocb };
 
-	return io_submit(aio->ctx, 1, iocbv);
+	int r = io_submit(aio->context, 1, iocbv);
+
+	if (r < 0)
+		return -1;
+
+	entry->pending = true;
+
+	return index;
 }
 
 LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, long long offset,
-               const void *buffer, size_t count, void *user_data)
+						   const void *buffer, size_t count, void *user_data)
 {
-	struct l_aio_request *req = l_new(struct l_aio_request, 1);
+	if (unlikely(!aio))
+		return -1;
 
-	req->cb = write_cb;
-	req->user_data = user_data;
+	int index = get_index(aio);
 
-	req->iocb = (struct iocb) {
+	if (index < 0)
+		return -1;
+
+	struct entry *entry = &aio->list[index];
+	
+	entry->callback = write_cb;
+	entry->user_data = user_data;
+
+	entry->iocb = (struct iocb) {
 		.aio_fildes = fd,
 		.aio_lio_opcode = IOCB_CMD_PWRITE,
 		.aio_reqprio = 0,
@@ -210,11 +297,96 @@ LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, long 
 		.aio_nbytes = count,
 		.aio_offset = offset,
 		.aio_flags = IOCB_FLAG_RESFD,
-		.aio_resfd = l_io_get_fd(aio->evfd),
-		.aio_data = (intptr_t)req
+		.aio_resfd = l_io_get_fd(aio->eventfd),
+		.aio_data = (intptr_t)entry
 	};
 
-	struct iocb *iocbv[] = { &req->iocb };
+	struct iocb *iocbv[] = { &entry->iocb };
 
-	return io_submit(aio->ctx, 1, iocbv);
+	int r = io_submit(aio->context, 1, iocbv);
+
+	if (r < 0)
+		return -1;
+
+	entry->pending = true;
+
+	return index;
 }
+
+LIB_EXPORT bool l_aio_cancel(struct l_aio *aio, unsigned reqid, ssize_t *result)
+{
+	if (unlikely(!aio))
+		return false;
+
+	if (unlikely(reqid >= aio->entries))
+		return false;
+
+	if (!aio->list[reqid].pending)
+		return false;
+
+	struct io_event event;
+	int r = io_cancel(aio->context, &aio->list[reqid].iocb, &event);
+
+	if (r >= 0) {
+		aio->list[reqid].pending = false;
+
+		if (result)
+			*result = get_result(&event);
+	}
+
+	return r >= 0;
+}
+
+LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanoseconds, ssize_t *result)
+{
+	if (unlikely(!aio))
+		return false;
+
+	struct timespec ts = { .tv_nsec = 0, .tv_sec = 0 };
+
+	if (nanoseconds > 0) {
+		ts.tv_nsec = nanoseconds % 1000000000;
+		ts.tv_sec = nanoseconds / 1000000000;
+	}
+
+	struct timespec *timeout = nanoseconds < 0 ? NULL : &ts;
+
+	for (;;) {
+		ssize_t r;
+		struct entry* entry =  await_next_block(aio, timeout, &r);
+
+		if (!entry)
+			return false;
+
+		if (entry == &aio->list[reqid]) {
+			entry->pending = false;
+
+			if (result)
+				*result = r;
+
+			break;
+		} else {
+			handle_request(entry, r);
+		}
+	}
+
+	return true;
+}
+
+LIB_EXPORT void l_aio_destroy(struct l_aio *aio)
+{
+	l_io_destroy(aio->eventfd);
+	io_destroy(aio->context);
+
+	for (int i = 0; i < aio->entries; i++) {
+		if (!aio->list[i].pending)
+			continue;
+
+		if (aio->list[i].callback)
+			aio->list[i].callback(-ECANCELED, aio->list[i].user_data);
+	}
+
+	l_free(aio->list);
+	l_free(aio);
+}
+
