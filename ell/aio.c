@@ -344,6 +344,9 @@ LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanosecon
 	if (unlikely(!aio))
 		return false;
 
+	if (unlikely(reqid >= aio->entries))
+		return false;
+
 	struct timespec ts = { .tv_nsec = 0, .tv_sec = 0 };
 
 	if (nanoseconds > 0) {
