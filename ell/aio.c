@@ -348,9 +348,12 @@ LIB_EXPORT bool l_aio_cancel(struct l_aio *aio, unsigned reqid, ssize_t *result)
 
 		if (result)
 			*result = get_result(&event);
-	}
 
-	return r >= 0;
+		return true;
+	} else {
+		// maybe the operation was a already finished
+		return l_aio_await(aio, reqid, 0, result);
+	}
 }
 
 LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanoseconds, ssize_t *result)
