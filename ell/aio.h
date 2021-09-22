@@ -37,6 +37,8 @@ typedef void (*l_aio_cb_t) (ssize_t result, void *user_data);
 
 struct l_aio *l_aio_create(unsigned maxevents);
 
+int l_aio_get_fd(struct l_aio *aio, unsigned reqid);
+
 int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long long offset,
                void *buffer, size_t count, void *user_data);
 

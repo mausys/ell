@@ -235,6 +235,20 @@ error_init:
 	return NULL;
 }
 
+LIB_EXPORT int l_aio_get_fd(struct l_aio *aio, unsigned reqid)
+{
+	if (unlikely(!aio))
+		return -1;
+
+	if (unlikely(reqid >= aio->entries))
+		return -1;
+
+	if (!aio->list[reqid].pending)
+		return -1;
+
+	return aio->list[reqid].iocb.aio_fildes;
+}
+
 LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, long long offset,
 						  void *buffer, size_t count, void *user_data)
 {
