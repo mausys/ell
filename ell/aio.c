@@ -58,7 +58,12 @@ struct entry {
 	struct iocb iocb;
 	l_aio_cb_t callback;
 	void *user_data;
-	bool pending;
+	ssize_t result;
+	enum {
+		STATE_NONE = 0,
+		STATE_WAIT,
+		STATE_READY
+	} state;
 };
 
 struct l_aio {
@@ -123,18 +128,20 @@ static ssize_t get_result(const struct io_event *event)
 	return result;
 }
 
-static void handle_request(struct entry *entry, ssize_t result)
+static void complete_entry(struct entry *entry)
 {
 	if (!entry)
 		return;
 
-	if (entry->callback)
-		entry->callback(result, entry->user_data);
-
-	entry->pending = false;
+	if (entry->callback) {
+		entry->state = STATE_NONE;
+		entry->callback(entry->result, entry->user_data);
+	} else {
+		entry->state = STATE_READY;
+	}
 }
 
-struct entry* await_next_block(struct l_aio *aio, struct timespec *timeout, ssize_t *result)
+struct entry* await_next_block(struct l_aio *aio, struct timespec *timeout)
 {
 
 	for (;;) {
@@ -145,8 +152,10 @@ struct entry* await_next_block(struct l_aio *aio, struct timespec *timeout, ssiz
 		if (r == 1) {
 			struct entry *entry = (struct entry*)event.data;
 
-			if (result)
-				*result = get_result(&event);
+			if ((entry < &aio->list[0]) && (entry > &aio->list[aio->entries - 1]))
+				continue;
+
+			entry->result = get_result(&event);
 
 			return entry;
 		} else if ((r < 0) && (errno == EINTR)) {
@@ -169,15 +178,14 @@ static bool event_callback(struct l_io *io, void *user_data)
 	if (r < 0) {} //ignore error, we are polling anyway
 
 	for (;;) {
-		ssize_t result;
 		static struct timespec timeout = { 0 };
 
-		struct entry* entry = await_next_block(aio, &timeout, &result);
+		struct entry* entry = await_next_block(aio, &timeout);
 
 		if (!entry)
 			break;
 
-		handle_request(entry, result);
+		complete_entry(entry);
 	}
 	return true;
 }
@@ -187,7 +195,7 @@ static int get_index(struct l_aio *aio)
 	unsigned index = aio->index;
 
 	do {
-		if (!aio->list[index].pending)
+		if (aio->list[index].state == STATE_NONE)
 			return index;
 
 		index = (index + 1) % aio->entries;
@@ -243,7 +251,7 @@ LIB_EXPORT int l_aio_get_fd(struct l_aio *aio, unsigned reqid)
 	if (unlikely(reqid >= aio->entries))
 		return -1;
 
-	if (!aio->list[reqid].pending)
+	if (aio->list[reqid].state == STATE_NONE)
 		return -1;
 
 	return aio->list[reqid].iocb.aio_fildes;
@@ -284,7 +292,7 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t o
 	if (r < 0)
 		return -1;
 
-	entry->pending = true;
+	entry->state = STATE_WAIT;
 
 	return index;
 }
@@ -324,7 +332,7 @@ LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t
 	if (r < 0)
 		return -1;
 
-	entry->pending = true;
+	entry->state = STATE_WAIT;
 
 	return index;
 }
@@ -337,14 +345,22 @@ LIB_EXPORT bool l_aio_cancel(struct l_aio *aio, unsigned reqid, ssize_t *result)
 	if (unlikely(reqid >= aio->entries))
 		return false;
 
-	if (!aio->list[reqid].pending)
+	if (aio->list[reqid].state == STATE_READY) {
+		aio->list[reqid].state = STATE_NONE;
+
+		if (result)
+			*result = aio->list[reqid].result;
+
+		return true;
+	} else if (aio->list[reqid].state != STATE_WAIT) {
 		return false;
+	}
 
 	struct io_event event;
 	int r = io_cancel(aio->context, &aio->list[reqid].iocb, &event);
 
 	if (r >= 0) {
-		aio->list[reqid].pending = false;
+		aio->list[reqid].state = STATE_NONE;
 
 		if (result)
 			*result = get_result(&event);
@@ -364,6 +380,17 @@ LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanosecon
 	if (unlikely(reqid >= aio->entries))
 		return false;
 
+	if (aio->list[reqid].state == STATE_READY) {
+		aio->list[reqid].state = STATE_NONE;
+
+		if (result)
+			*result = aio->list[reqid].result;
+
+		return true;
+	} else if (aio->list[reqid].state != STATE_WAIT) {
+		return false;
+	}
+
 	struct timespec ts = { .tv_nsec = 0, .tv_sec = 0 };
 
 	if (nanoseconds > 0) {
@@ -374,21 +401,20 @@ LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanosecon
 	struct timespec *timeout = nanoseconds < 0 ? NULL : &ts;
 
 	for (;;) {
-		ssize_t r;
-		struct entry* entry =  await_next_block(aio, timeout, &r);
+		struct entry* entry =  await_next_block(aio, timeout);
 
 		if (!entry)
 			return false;
 
 		if (entry == &aio->list[reqid]) {
-			entry->pending = false;
+			entry->state = STATE_NONE;
 
 			if (result)
-				*result = r;
+				*result = entry->result;
 
 			break;
 		} else {
-			handle_request(entry, r);
+			complete_entry(entry);
 		}
 	}
 
@@ -401,7 +427,7 @@ LIB_EXPORT void l_aio_destroy(struct l_aio *aio)
 	io_destroy(aio->context);
 
 	for (int i = 0; i < aio->entries; i++) {
-		if (!aio->list[i].pending)
+		if (aio->list[i].state != STATE_WAIT)
 			continue;
 
 		if (aio->list[i].callback)
