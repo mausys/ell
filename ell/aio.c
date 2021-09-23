@@ -418,8 +418,6 @@ LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanosecon
 
 	struct timespec *timeout = nanoseconds < 0 ? NULL : &ts;
 
-	bool bycatch = aio->bycatch;
-
 	for (;;) {
 		struct entry* entry =  await_next_block(aio, timeout);
 
@@ -437,15 +435,8 @@ LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanosecon
 			entry->state = STATE_READY;
 
 			if (entry->callback)
-				bycatch = true;
+				aio->bycatch = true;
 		}
-	}
-
-	if (bycatch && !aio->bycatch) {
-		aio->bycatch = true;
-		uint64_t counter = 0;
-		int r = write(l_io_get_fd(aio->eventfd), &counter, sizeof(counter));
-		if (r < 0) {}
 	}
 
 	return true;
