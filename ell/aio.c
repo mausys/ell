@@ -72,6 +72,7 @@ struct l_aio {
 	unsigned entries;
 	unsigned index;
 	struct l_io *eventfd;
+	bool bycatch;
 };
 
 static bool io_ring_is_empty(aio_context_t context, struct timespec *timeout)
@@ -128,19 +129,6 @@ static ssize_t get_result(const struct io_event *event)
 	return result;
 }
 
-static void complete_entry(struct entry *entry)
-{
-	if (!entry)
-		return;
-
-	if (entry->callback) {
-		entry->state = STATE_NONE;
-		entry->callback(entry->result, entry->user_data);
-	} else {
-		entry->state = STATE_READY;
-	}
-}
-
 struct entry* await_next_block(struct l_aio *aio, struct timespec *timeout)
 {
 
@@ -177,6 +165,22 @@ static bool event_callback(struct l_io *io, void *user_data)
 
 	if (r < 0) {} //ignore error, we are polling anyway
 
+	if (aio->bycatch) {
+		aio->bycatch = false;
+		for (int i = 0; i < aio->entries; i++) {
+			struct entry* entry = &aio->list[i];
+
+			if (entry->state != STATE_READY)
+				continue;
+
+			if (!entry->callback)
+				continue;
+
+			entry->state = STATE_NONE;
+			entry->callback(entry->result, entry->user_data);
+		}
+	}
+
 	for (;;) {
 		static struct timespec timeout = { 0 };
 
@@ -185,7 +189,12 @@ static bool event_callback(struct l_io *io, void *user_data)
 		if (!entry)
 			break;
 
-		complete_entry(entry);
+		if (entry->callback) {
+			entry->state = STATE_NONE;
+			entry->callback(entry->result, entry->user_data);
+		} else {
+			entry->state = STATE_READY;
+		}
 	}
 	return true;
 }
@@ -270,20 +279,23 @@ LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t o
 
 	struct entry *entry = &aio->list[index];
 
-	entry->callback = read_cb;
-	entry->user_data = user_data;
+	*entry = (struct entry) {
+		.callback = read_cb,
+		.user_data = user_data,
 
-	entry->iocb = (struct iocb) {
-		.aio_fildes = fd,
-		.aio_lio_opcode = IOCB_CMD_PREAD,
-		.aio_reqprio = 0,
-		.aio_buf = (intptr_t)buffer,
-		.aio_nbytes = count,
-		.aio_offset = offset,
-		.aio_flags = IOCB_FLAG_RESFD,
-		.aio_resfd = l_io_get_fd(aio->eventfd),
-		.aio_data = (intptr_t)entry
+		.iocb.aio_fildes = fd,
+		.iocb.aio_lio_opcode = IOCB_CMD_PREAD,
+		.iocb.aio_reqprio = 0,
+		.iocb.aio_buf = (intptr_t)buffer,
+		.iocb.aio_nbytes = count,
+		.iocb.aio_offset = offset,
+		.iocb.aio_data = (intptr_t)entry
 	};
+
+	if (entry->callback) {
+		entry->iocb.aio_flags |= IOCB_FLAG_RESFD;
+		entry->iocb.aio_resfd = l_io_get_fd(aio->eventfd);
+	}
 
 	struct iocb *iocbv[] = { &entry->iocb };
 
@@ -309,21 +321,24 @@ LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t
 		return -1;
 
 	struct entry *entry = &aio->list[index];
-	
-	entry->callback = write_cb;
-	entry->user_data = user_data;
 
-	entry->iocb = (struct iocb) {
-		.aio_fildes = fd,
-		.aio_lio_opcode = IOCB_CMD_PWRITE,
-		.aio_reqprio = 0,
-		.aio_buf = (intptr_t)buffer,
-		.aio_nbytes = count,
-		.aio_offset = offset,
-		.aio_flags = IOCB_FLAG_RESFD,
-		.aio_resfd = l_io_get_fd(aio->eventfd),
-		.aio_data = (intptr_t)entry
+	*entry = (struct entry) {
+		.callback = write_cb,
+		.user_data = user_data,
+
+		.iocb.aio_fildes = fd,
+		.iocb.aio_lio_opcode = IOCB_CMD_PWRITE,
+		.iocb.aio_reqprio = 0,
+		.iocb.aio_buf = (intptr_t)buffer,
+		.iocb.aio_nbytes = count,
+		.iocb.aio_offset = offset,
+		.iocb.aio_data = (intptr_t)entry
 	};
+
+	if (entry->callback) {
+		entry->iocb.aio_flags |= IOCB_FLAG_RESFD;
+		entry->iocb.aio_resfd = l_io_get_fd(aio->eventfd);
+	}
 
 	struct iocb *iocbv[] = { &entry->iocb };
 
@@ -400,6 +415,8 @@ LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanosecon
 
 	struct timespec *timeout = nanoseconds < 0 ? NULL : &ts;
 
+	bool bycatch = aio->bycatch;
+
 	for (;;) {
 		struct entry* entry =  await_next_block(aio, timeout);
 
@@ -414,8 +431,18 @@ LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanosecon
 
 			break;
 		} else {
-			complete_entry(entry);
+			entry->state = STATE_READY;
+
+			if (entry->callback)
+				bycatch = true;
 		}
+	}
+
+	if (bycatch && !aio->bycatch) {
+		aio->bycatch = true;
+		uint64_t counter = 0;
+		int r = write(l_io_get_fd(aio->eventfd), &counter, sizeof(counter));
+		if (r < 0) {}
 	}
 
 	return true;
