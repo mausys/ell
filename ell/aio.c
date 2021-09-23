@@ -131,7 +131,6 @@ static ssize_t get_result(const struct io_event *event)
 
 struct entry* await_next_block(struct l_aio *aio, struct timespec *timeout)
 {
-
 	for (;;) {
 		struct io_event event;
 
@@ -236,14 +235,18 @@ LIB_EXPORT struct l_aio * l_aio_create(unsigned maxevents)
 
 	aio->eventfd = l_io_new(efd);
 
+	if (!aio->eventfd)
+		goto error_io;
+
 	if (!l_io_set_read_handler(aio->eventfd, event_callback, aio, NULL))
 		goto error_handler;
 
 	return aio;
 
 error_handler:
-	close(efd);
 	l_io_destroy(aio->eventfd);
+error_io:
+	close(efd);
 error_event:
 	io_destroy(aio->context);
 error_init:
