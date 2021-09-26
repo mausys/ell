@@ -37,18 +37,18 @@ typedef void (*l_aio_cb_t) (ssize_t result, void *user_data);
 
 struct l_aio *l_aio_create(void);
 
-int l_aio_get_fd(struct l_aio *aio, unsigned reqid);
+int l_aio_get_fd(struct l_aio *aio, uint32_t reqid);
 
-int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t offset,
+int32_t l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t offset,
                void *buffer, size_t count, void *user_data);
 
 
-int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t offset,
+int32_t l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t offset,
                const void *buffer, size_t count, void *user_data);
 
-bool l_aio_cancel(struct l_aio *aio, unsigned reqid, ssize_t *result);
+bool l_aio_cancel(struct l_aio *aio, uint32_t reqid, ssize_t *result);
 
-bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanoseconds, ssize_t *result);
+bool l_aio_await(struct l_aio *aio, uint32_t reqid, int64_t nanoseconds, ssize_t *result);
 
 void l_aio_destroy(struct l_aio *aio);
 

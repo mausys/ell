@@ -41,14 +41,16 @@
 #include "aio.h"
 
 
-#define QUEUEID_SHIFT 12
-#define QUEUEID_MASK 0x7000
-#define REQID_MASK 0x0fff
+#define QUEUEID_SHIFT 28
+#define QUEUEID_MASK  0x70000000
+#define REQID_MASK    0x0fffffff
 
 
 typedef enum {
-  QUEUEID_POLL = 1,
-  QUEUEID_WAIT = 2
+	QUEUEID_INVALID = 0,
+	QUEUEID_POLL,
+	QUEUEID_WAIT,
+	QUEUEID_LAST = QUEUEID_WAIT
 } queueid_t;
 
 typedef enum {
@@ -56,12 +58,17 @@ typedef enum {
 	CMD_WRITE
 } command_t;
 
+struct suspend_t {
+	uint32_t reqid;
+	int64_t timeout;
+};
+
 struct entry {
 	struct aiocb aiocb;
 	l_aio_cb_t callback;
 	void *user_data;
 	ssize_t result;
-	unsigned id;
+	uint32_t reqid;
 };
 
 struct notifier {
@@ -73,19 +80,20 @@ struct l_aio {
 	struct l_queue *wait_list;
 	struct l_queue *ready_list;
 	struct l_io *eventfd;
-	unsigned next_id;
+	uint32_t next_reqid;
 	struct notifier notifier;
 };
 
-static queueid_t get_queueid(unsigned reqid)
+static queueid_t get_queueid(uint32_t reqid)
 {
-	return (reqid & QUEUEID_MASK) >> QUEUEID_SHIFT;
+	uint32_t queueid = (reqid & QUEUEID_MASK) >> QUEUEID_SHIFT;
+	return queueid <= QUEUEID_LAST ? (queueid_t) queueid : QUEUEID_INVALID;
 }
 
-static unsigned get_reqid(struct l_aio *aio, queueid_t queueid)
+static uint32_t new_reqid(struct l_aio *aio, queueid_t queueid)
 {
-	unsigned requid = ((queueid << QUEUEID_SHIFT) & QUEUEID_MASK) | aio->next_id;
-	aio->next_id = (aio->next_id + 1) & REQID_MASK;
+	uint32_t requid = ((queueid << QUEUEID_SHIFT) & QUEUEID_MASK) | aio->next_reqid;
+	aio->next_reqid = (aio->next_reqid + 1) & REQID_MASK;
 	return requid;
 }
 
@@ -148,7 +156,7 @@ static bool poll_entry(void *data, void *user_data)
 	return true;
 }
 
-static bool suspend(struct entry *entry, int64_t nanoseconds)
+static bool suspend_entry(struct entry *entry, int64_t nanoseconds)
 {
 	if (nanoseconds == 0)
 		return false;
@@ -187,23 +195,34 @@ static bool cancel_entry(struct entry *entry)
 	}
 }
 
-static  bool cancel_entry_if(const void *a, const void *b)
+static bool cancel_entry_if(const void *a, const void *b)
 {
 	struct entry *entry = (struct entry *)a;
-	const int *id = b;
+	const uint32_t *id = b;
 
-	if (entry->id != *id)
+	if (entry->reqid != *id)
 		return false;
 
 	return cancel_entry(entry);
 }
 
-static  bool match_entry(const void *a, const void *b)
+static bool suspend_entry_if(const void *a, const void *b)
+{
+	struct entry *entry = (struct entry *)a;
+	const struct suspend_t *suspend = b;
+
+	if (entry->reqid != suspend->reqid)
+		return false;
+
+	return suspend_entry(entry, suspend->timeout);
+}
+
+static bool match_entry(const void *a, const void *b)
 {
 	const struct entry *entry = a;
-	const int *id = b;
+	const uint32_t *id = b;
 
-	return entry->id == *id;
+	return entry->reqid == *id;
 }
 
 static bool event_callback(struct l_io *io, void *user_data)
@@ -221,7 +240,7 @@ static bool event_callback(struct l_io *io, void *user_data)
 	return true;
 }
 
-static int submit_command(struct l_aio *aio, command_t cmd, l_aio_cb_t callback, int fd, off_t offset,
+static int32_t submit_command(struct l_aio *aio, command_t cmd, l_aio_cb_t callback, int fd, off_t offset,
                            void *buffer, size_t count, void *user_data)
 {
 	if (unlikely(!aio))
@@ -256,14 +275,14 @@ static int submit_command(struct l_aio *aio, command_t cmd, l_aio_cb_t callback,
 		goto error_aio;
 
 	if (callback) {
-		entry->id = get_reqid(aio, QUEUEID_WAIT);
+		entry->reqid = new_reqid(aio, QUEUEID_WAIT);
 		l_queue_push_tail(aio->wait_list, entry);
 	} else {
-		entry->id = get_reqid(aio, QUEUEID_POLL);
+		entry->reqid = new_reqid(aio, QUEUEID_POLL);
 		l_queue_push_tail(aio->poll_list, entry);
 	}
 
-	return entry->id;
+	return entry->reqid;
 
 error_aio:
 	l_free(entry);
@@ -305,15 +324,26 @@ error_event:
 	return NULL;
 }
 
-LIB_EXPORT int l_aio_get_fd(struct l_aio *aio, unsigned reqid)
+LIB_EXPORT int l_aio_get_fd(struct l_aio *aio, uint32_t reqid)
 {
 	if (unlikely(!aio))
 		return -1;
 
-	unsigned qid = get_queueid(reqid);
+	queueid_t qid = get_queueid(reqid);
 
-	struct entry *entry = qid == QUEUEID_POLL ? l_queue_find(aio->poll_list, match_entry, &reqid) :
-		l_queue_find(aio->wait_list, match_entry, &reqid);
+	struct entry *entry;
+
+	switch (qid) {
+		case QUEUEID_INVALID:
+			entry = NULL;
+			break;
+		case QUEUEID_POLL:
+			entry = l_queue_find(aio->poll_list, match_entry, &reqid);
+			break;
+		case QUEUEID_WAIT:
+			entry = l_queue_find(aio->wait_list, match_entry, &reqid);
+			break;
+	}
 
 	if (!entry)
 		return -1;
@@ -321,59 +351,76 @@ LIB_EXPORT int l_aio_get_fd(struct l_aio *aio, unsigned reqid)
 	return entry->aiocb.aio_fildes;
 }
 
-LIB_EXPORT int l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t offset,
+LIB_EXPORT int32_t l_aio_read(struct l_aio *aio, l_aio_cb_t read_cb, int fd, off_t offset,
 						  void *buffer, size_t count, void *user_data)
 {
 	return submit_command(aio, CMD_READ, read_cb, fd, offset, buffer, count, user_data);
 }
 
-LIB_EXPORT int l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t offset,
+LIB_EXPORT int32_t l_aio_write(struct l_aio *aio, l_aio_cb_t write_cb, int fd, off_t offset,
 						   const void *buffer, size_t count, void *user_data)
 {
 	return submit_command(aio, CMD_WRITE, write_cb, fd, offset, (void *)buffer, count, user_data);
 }
 
-LIB_EXPORT bool l_aio_cancel(struct l_aio *aio, unsigned reqid, ssize_t *result)
+LIB_EXPORT bool l_aio_cancel(struct l_aio *aio, uint32_t reqid, ssize_t *result)
 {
 	if (unlikely(!aio))
 		return false;
 
-	unsigned qid = get_queueid(reqid);
+	queueid_t qid = get_queueid(reqid);
 
-	struct entry *entry = qid == QUEUEID_POLL ? l_queue_remove_if(aio->poll_list, cancel_entry_if, &reqid) :
-		l_queue_remove_if(aio->wait_list, cancel_entry_if, &reqid);
+	struct entry *entry;
+
+	switch (qid) {
+		case QUEUEID_INVALID:
+			entry = NULL;
+			break;
+		case QUEUEID_POLL:
+			entry = l_queue_remove_if(aio->poll_list, cancel_entry_if, &reqid);
+			break;
+		case QUEUEID_WAIT:
+			entry = l_queue_remove_if(aio->wait_list, cancel_entry_if, &reqid);
+			break;
+	}
 
 	if (!entry)
 		return false;
 
 	delete_entry(entry, result);
 
-	return false;
+	return true;
 }
 
-LIB_EXPORT bool l_aio_await(struct l_aio *aio, unsigned reqid, int64_t nanoseconds, ssize_t *result)
+LIB_EXPORT bool l_aio_await(struct l_aio *aio, uint32_t reqid, int64_t nanoseconds, ssize_t *result)
 {
 	if (unlikely(!aio))
 		return false;
 
-	unsigned qid = get_queueid(reqid);
+	queueid_t qid = get_queueid(reqid);
 
-	struct entry *entry = qid == QUEUEID_POLL ? l_queue_remove_if(aio->poll_list, match_entry, &reqid) :
-		l_queue_remove_if(aio->wait_list, match_entry, &reqid);
+	struct suspend_t suspend = { .reqid = reqid, .timeout = nanoseconds };
+
+	struct entry *entry;
+
+	switch (qid) {
+		case QUEUEID_INVALID:
+			entry = NULL;
+			break;
+		case QUEUEID_POLL:
+			entry = l_queue_remove_if(aio->poll_list, suspend_entry_if, &suspend);
+			break;
+		case QUEUEID_WAIT:
+			entry = l_queue_remove_if(aio->wait_list, suspend_entry_if, &suspend);
+			break;
+	}
 
 	if (!entry)
 		return false;
 
-	if (suspend(entry, nanoseconds)) {
-		delete_entry(entry, result);
-		return true;
-	} else {
-		if (entry->callback)
-			l_queue_push_tail(aio->wait_list, entry);
-		else
-			l_queue_push_tail(aio->poll_list, entry);
-		return false;
-	}
+	delete_entry(entry, result);
+
+	return true;
 }
 
 LIB_EXPORT void l_aio_destroy(struct l_aio *aio)
