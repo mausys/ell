@@ -195,6 +195,19 @@ static bool cancel_entry(struct entry *entry)
 	}
 }
 
+static void clear_entry(void *data)
+{
+	struct entry *entry = (struct entry *)data;
+
+	if (!cancel_entry(entry))
+		suspend_entry(entry, -1);
+
+	if (entry->callback)
+		entry->callback(entry->result, entry->user_data);
+
+	l_free(entry);
+}
+
 static bool cancel_entry_if(const void *a, const void *b)
 {
 	struct entry *entry = (struct entry *)a;
@@ -427,10 +440,10 @@ LIB_EXPORT void l_aio_destroy(struct l_aio *aio)
 {
 	l_io_destroy(aio->eventfd);
 
-	//TODO cancel and suspend all pending operations
-	l_queue_destroy(aio->poll_list, NULL);
+
+	l_queue_destroy(aio->poll_list, clear_entry);
+	l_queue_destroy(aio->wait_list, clear_entry);
 	l_queue_destroy(aio->ready_list, NULL);
-	l_queue_destroy(aio->wait_list, NULL);
 	l_free(aio);
 }
 
